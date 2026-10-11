@@ -4,33 +4,26 @@ import { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { DigSystem } from './DigSystem'
+import { VehicleSystem } from './VehicleSystem'
 
-/**
- * FirstPersonGame
- * A minimal first-person walk-around sandbox.
- * - Infinite Unity-like gray ground (grid + soft shading)
- * - WASD movement, mouse look, Space to jump, Shift to sprint
- * - Sky-blue gradient background + hemisphere light
- */
 export default function FirstPersonGame() {
   const mountRef = useRef<HTMLDivElement>(null)
   const [locked, setLocked] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const controlsRef = useRef<PointerLockControls | null>(null)
 
-  // State shared between React UI and the render loop
   const lockedRef = useRef(false)
   useEffect(() => {
     lockedRef.current = locked
   }, [locked])
 
-  // Hotbar: 4 slots (slot 1 holds a pickaxe). -1 means nothing selected.
   const HOTBAR_SIZE = 4
   const HOTBAR_ITEMS: Array<{ icon: string | null }> = [
-    { icon: '/pickaxe.png' }, // slot 1: pickaxe
-    { icon: null }, // slot 2: empty
-    { icon: null }, // slot 3: empty
-    { icon: null }, // slot 4: empty
+    { icon: '/pickaxe.png' },
+    { icon: null },
+    { icon: null },
+    { icon: null },
   ]
   const [selectedSlot, setSelectedSlot] = useState<number>(-1)
   const selectedSlotRef = useRef(-1)
@@ -38,8 +31,6 @@ export default function FirstPersonGame() {
     selectedSlotRef.current = selectedSlot
   }, [selectedSlot])
 
-  // Listen for hotbar selection keys (1-4). Pressing the same key again
-  // toggles the slot off (returns to "nothing selected").
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       let idx = -1
@@ -55,8 +46,6 @@ export default function FirstPersonGame() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  // Mouse wheel cycles through hotbar slots (only when pointer is locked).
-  // Wraps around from last -> first and first -> last.
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       if (!lockedRef.current) return
@@ -76,7 +65,7 @@ export default function FirstPersonGame() {
 
     // ---------- Scene ----------
     const scene = new THREE.Scene()
-    scene.background = new THREE.Color(0x9ec7e2) // soft sky blue
+    scene.background = new THREE.Color(0x9ec7e2)
     scene.fog = new THREE.Fog(0x9ec7e2, 60, 220)
 
     // ---------- Camera ----------
@@ -86,14 +75,17 @@ export default function FirstPersonGame() {
       0.1,
       2000
     )
-    camera.position.set(0, 1.7, 0) // eye height ~1.7m
+    camera.position.set(0, 1.7, 0)
 
     // ---------- Renderer ----------
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      powerPreference: 'high-performance',
+    })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.setSize(window.innerWidth, window.innerHeight)
     renderer.shadowMap.enabled = true
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    renderer.shadowMap.type = THREE.PCFShadowMap
     mount.appendChild(renderer.domElement)
 
     // ---------- Lights ----------
@@ -113,21 +105,16 @@ export default function FirstPersonGame() {
     sun.shadow.bias = -0.0005
     scene.add(sun)
 
-    // ---------- Ground (chunked terrain, generates out of view) ----------
-    // The world is divided into square chunks. We keep a grid of chunks around
-    // the player and recycle far chunks to new positions when the player
-    // crosses a chunk boundary. Because recycled chunks are placed at the far
-    // edge of the grid (deep in fog), the player never sees terrain pop in.
-    const CHUNK_SIZE = 80 // world units per chunk
-    const CHUNK_SEGMENTS = 48 // 48x48 verts per chunk (~1.67 units/vert)
-    const GRID_RADIUS = 3 // 7x7 = 49 chunks around the player
+    // ---------- Terrain setup ----------
+    const CHUNK_SIZE = 80
+    const CHUNK_SEGMENTS = 48
+    const GRID_RADIUS = 3
 
     const terrainParams: TerrainParams = SHARED_TERRAIN
 
     const dirtTexture = makeDirtTexture()
     dirtTexture.wrapS = THREE.RepeatWrapping
     dirtTexture.wrapT = THREE.RepeatWrapping
-    // Repeat per chunk so texture density is consistent everywhere
     dirtTexture.repeat.set(CHUNK_SIZE / 6, CHUNK_SIZE / 6)
     dirtTexture.anisotropy = renderer.capabilities.getMaxAnisotropy()
 
@@ -138,39 +125,68 @@ export default function FirstPersonGame() {
       metalness: 0.0,
     })
 
+    // ---------- Crater material ----------
+    // نسخه‌ی clone از chunkMat با polygonOffset تا گودال‌ها همیشه روی
+    // زمین پایه رندر شوند و z-fighting نداشته باشند.
+    const craterMat = chunkMat.clone()
+    craterMat.polygonOffset = true
+    craterMat.polygonOffsetFactor = -1
+    craterMat.polygonOffsetUnits = -1
+
+    // ---------- Dig system ----------
+    const digSystem = new DigSystem({
+      scene,
+      camera,
+      baseSampleHeight: (x, z) => sampleTerrainHeight(x, z, terrainParams.seed),
+      craterMaterial: craterMat,
+      craterUvScale: CHUNK_SIZE,
+      craterRings: 16,
+      craterSectors: 28,
+    })
+
     interface Chunk {
       mesh: THREE.Mesh
       gridX: number
       gridZ: number
     }
 
-    // Pool of chunk meshes (reused, never created/destroyed during play)
     const chunks: Chunk[] = []
 
-    // Bake heights into a chunk's geometry for its world position.
+    // Bake heights + world-space UVs into a chunk's geometry.
     function bakeChunk(chunk: Chunk, gridX: number, gridZ: number) {
       const geo = chunk.mesh.geometry as THREE.BufferGeometry
       const pos = geo.attributes.position as THREE.BufferAttribute
+      const uvAttr = geo.attributes.uv as THREE.BufferAttribute
       const worldOffsetX = gridX * CHUNK_SIZE
       const worldOffsetZ = gridZ * CHUNK_SIZE
+
       for (let i = 0; i < pos.count; i++) {
         const lx = pos.getX(i)
         const lz = pos.getZ(i)
-        pos.setY(i, sampleTerrainHeight(worldOffsetX + lx, worldOffsetZ + lz, terrainParams.seed))
+        const wx = worldOffsetX + lx
+        const wz = worldOffsetZ + lz
+        pos.setY(i, digSystem.sampleHeight(wx, wz))
+        // UV in world space → texture tiles continuously across chunks.
+        uvAttr.setXY(i, wx / CHUNK_SIZE, wz / CHUNK_SIZE)
       }
       pos.needsUpdate = true
+      uvAttr.needsUpdate = true
       geo.computeVertexNormals()
       chunk.mesh.position.set(worldOffsetX, 0, worldOffsetZ)
       chunk.gridX = gridX
       chunk.gridZ = gridZ
     }
 
-    // Initial bake: fill the 7x7 grid centered on origin
+    // Initial 7x7 bake
     {
-      let idx = 0
       for (let dx = -GRID_RADIUS; dx <= GRID_RADIUS; dx++) {
         for (let dz = -GRID_RADIUS; dz <= GRID_RADIUS; dz++) {
-          const geo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, CHUNK_SEGMENTS, CHUNK_SEGMENTS)
+          const geo = new THREE.PlaneGeometry(
+            CHUNK_SIZE,
+            CHUNK_SIZE,
+            CHUNK_SEGMENTS,
+            CHUNK_SEGMENTS
+          )
           geo.rotateX(-Math.PI / 2)
           const mesh = new THREE.Mesh(geo, chunkMat)
           mesh.receiveShadow = true
@@ -178,28 +194,68 @@ export default function FirstPersonGame() {
           const chunk: Chunk = { mesh, gridX: 0, gridZ: 0 }
           bakeChunk(chunk, dx, dz)
           chunks.push(chunk)
-          idx++
         }
       }
     }
 
-    // Update visible chunks based on player's current grid cell.
-    // Recycles chunks that fell out of the grid to the newly-needed slots.
+    // Rebake chunks overlapping a region (used after each dig)
+    function rebakeChunksNear(x: number, z: number, radius: number) {
+      const half = CHUNK_SIZE / 2
+      for (const chunk of chunks) {
+        const cx = chunk.gridX * CHUNK_SIZE
+        const cz = chunk.gridZ * CHUNK_SIZE
+        if (
+          x + radius >= cx - half &&
+          x - radius <= cx + half &&
+          z + radius >= cz - half &&
+          z - radius <= cz + half
+        ) {
+          bakeChunk(chunk, chunk.gridX, chunk.gridZ)
+        }
+      }
+    }
+
+    digSystem.setChunkProvider(
+      () => chunks.map((c) => c.mesh),
+      rebakeChunksNear
+    )
+
+    // ---------- Vehicles ----------
+    const vehicleSystem = new VehicleSystem({
+      scene,
+      url: '/bil_mechanici.glb',
+      sampleHeight: (x, z) => digSystem.sampleHeight(x, z),
+      scatterRadius: 35,
+      useOriginalScale: true,
+      scaleMultiplier: 1.0,
+      castShadow: true,
+      receiveShadow: true,
+      alignToGround: true,
+      tiltSmoothing: 6,
+      gravity: 25,
+      yOffset: 0,
+      footprintRatio: 0.5,
+      onLoaded: (names) => {
+        console.log(`[vehicles] ${names.length} vehicle(s) spawned:`, names)
+      },
+      onError: (err) => {
+        console.error('[vehicles] failed:', err)
+      },
+    })
+
+    // Chunk recycling around the player
     function updateChunks(playerGridX: number, playerGridZ: number) {
-      // Build the set of desired grid coordinates around the player
       const desired = new Set<string>()
       for (let dx = -GRID_RADIUS; dx <= GRID_RADIUS; dx++) {
         for (let dz = -GRID_RADIUS; dz <= GRID_RADIUS; dz++) {
           desired.add(`${playerGridX + dx},${playerGridZ + dz}`)
         }
       }
-      // Find chunks that are no longer in the desired set (to recycle)
       const toRecycle: Chunk[] = []
       for (const chunk of chunks) {
         const key = `${chunk.gridX},${chunk.gridZ}`
         if (!desired.has(key)) toRecycle.push(chunk)
       }
-      // Find desired slots that don't have a chunk yet
       const occupied = new Set(chunks.map((c) => `${c.gridX},${c.gridZ}`))
       const missing: Array<[number, number]> = []
       for (let dx = -GRID_RADIUS; dx <= GRID_RADIUS; dx++) {
@@ -209,16 +265,13 @@ export default function FirstPersonGame() {
           if (!occupied.has(`${gx},${gz}`)) missing.push([gx, gz])
         }
       }
-      // Recycle: assign each missing slot to a recycled chunk and re-bake.
-      // The missing slots are at the far edge of the grid (deep in fog),
-      // so the player never sees this happen.
       for (let i = 0; i < toRecycle.length && i < missing.length; i++) {
         bakeChunk(toRecycle[i], missing[i][0], missing[i][1])
       }
     }
 
-    // Spawn the player on top of the terrain at origin
-    camera.position.set(0, sampleTerrainHeight(0, 0, 1337) + 1.7, 0)
+    // Spawn on terrain
+    camera.position.set(0, digSystem.sampleHeight(0, 0) + 1.7, 0)
 
     // ---------- Controls ----------
     const controls = new PointerLockControls(camera, renderer.domElement)
@@ -228,40 +281,29 @@ export default function FirstPersonGame() {
     controls.addEventListener('lock', () => setLocked(true))
     controls.addEventListener('unlock', () => setLocked(false))
 
-    // ---------- Held item (3D pickaxe loaded from GLB, follows camera) ----------
-    // Structure:
-    //   pickaxe (outer)  -> follows camera position + orientation
-    //   swingPivot (inner) -> applies swing rotation around the hand (handle bottom)
-    //   model -> offset upward so handle bottom sits at swingPivot origin
+    // ---------- Held pickaxe ----------
     const pickaxe = new THREE.Group()
     pickaxe.visible = false
     scene.add(pickaxe)
     const swingPivot = new THREE.Group()
     pickaxe.add(swingPivot)
     const heldItemRef = { pickaxe, swingPivot }
-    // View-space offset: right, down, forward (relative to camera facing)
-    const heldOffset = new THREE.Vector3(0.55, -0.3, -1.0)
+    const heldOffset = new THREE.Vector3(0.5, -0.40, -0.70)
 
-    // Load the pickaxe model from the GLB file
     const gltfLoader = new GLTFLoader()
     gltfLoader.load(
       '/pickaxe.glb',
       (gltf) => {
         const model = gltf.scene
 
-        // 1) Orient so handle runs along +Y with the head on top.
         orientHandleUp(model)
 
-        // 2) Scale to a comfortable first-person size.
         const box = new THREE.Box3().setFromObject(model)
         const size = box.getSize(new THREE.Vector3())
         const maxDim = Math.max(size.x, size.y, size.z) || 1
-        model.scale.setScalar((1.0 / maxDim) * 0.5)
+        model.scale.setScalar((1.0 / maxDim) * 0.8)
         model.updateMatrixWorld(true)
 
-        // 3) Re-center, then shift up so the handle bottom sits at the
-        //    swingPivot origin. This makes swing rotation pivot around the
-        //    hand grip, so the head arcs forward while the handle stays put.
         const box2 = new THREE.Box3().setFromObject(model)
         const center2 = box2.getCenter(new THREE.Vector3())
         const modelHeight = box2.getSize(new THREE.Vector3()).y
@@ -270,14 +312,8 @@ export default function FirstPersonGame() {
         model.position.z -= center2.z
         model.position.y += modelHeight / 2
 
-        // 4) Face the camera (both prongs visible) by rotating around Y.
-        //    Applied to the MODEL itself, so swing rotation (on swingPivot)
-        //    happens BEFORE the face turn — keeping the chop in the vertical
-        //    screen plane. Uses rotateY (multiplies onto orientHandleUp's
-        //    quaternion) rather than overwriting rotation directly.
         model.rotateY(Math.PI / 2)
 
-        // Enable shadows on all meshes
         model.traverse((child) => {
           if ((child as THREE.Mesh).isMesh) {
             const mesh = child as THREE.Mesh
@@ -296,7 +332,14 @@ export default function FirstPersonGame() {
     // ---------- Movement ----------
     const velocity = new THREE.Vector3()
     const direction = new THREE.Vector3()
-    const move = { forward: false, backward: false, left: false, right: false, jump: false, sprint: false }
+    const move = {
+      forward: false,
+      backward: false,
+      left: false,
+      right: false,
+      jump: false,
+      sprint: false,
+    }
     let canJump = false
 
     const onKeyDown = (e: KeyboardEvent) => {
@@ -359,36 +402,40 @@ export default function FirstPersonGame() {
     window.addEventListener('keydown', onKeyDown)
     window.addEventListener('keyup', onKeyUp)
 
-    // ---------- Swing (left-click attack) ----------
-    // When the player left-clicks while holding the pickaxe, we trigger a
-    // swing animation: the pickaxe rotates forward then back, like a strike.
-    let swingTime = -1 // -1 = idle; >=0 = animation progress in seconds
-    const SWING_DURATION = 0.45 // total swing time in seconds
+    // ---------- Swing ----------
+    const SWING_DURATION = 0.55
+    const WINDUP_END = 0.16
+    const STRIKE_END = 0.31
+    let swingTime = -1
+    let impactDone = false
+
     const onMouseDown = (e: MouseEvent) => {
-      if (e.button !== 0) return // only left click
-      if (!lockedRef.current) return // ignore when not playing
-      if (selectedSlotRef.current !== 0) return // only when pickaxe selected
-      if (swingTime >= 0 && swingTime < SWING_DURATION) return // not re-trigger mid-swing
+      if (e.button !== 0) return
+      if (!lockedRef.current) return
+      if (selectedSlotRef.current !== 0) return
+      if (swingTime >= 0) return
       swingTime = 0
+      impactDone = false
     }
     window.addEventListener('mousedown', onMouseDown)
 
     // ---------- Animation Loop ----------
-    const clock = new THREE.Clock()
+    const timer = new SimpleTimer()
     let raf = 0
     let firstFrame = true
     let lastPlayerGridX = 0
     let lastPlayerGridZ = 0
-    let bobPhase = 0 // walking bob phase for held item
+    let bobPhase = 0
 
     const animate = () => {
       raf = requestAnimationFrame(animate)
-      const dt = Math.min(clock.getDelta(), 0.1)
+      timer.update()
+      const dt = Math.min(timer.getDelta(), 0.1)
 
-      // Friction / damping
+      // Physics
       velocity.x -= velocity.x * 10 * dt
       velocity.z -= velocity.z * 10 * dt
-      velocity.y -= 25 * dt // gravity
+      velocity.y -= 25 * dt
 
       direction.z = Number(move.forward) - Number(move.backward)
       direction.x = Number(move.right) - Number(move.left)
@@ -399,20 +446,17 @@ export default function FirstPersonGame() {
       if (move.forward || move.backward) velocity.z -= direction.z * speed * dt * 10
       if (move.left || move.right) velocity.x -= direction.x * speed * dt * 10
 
-      // Only move when pointer is locked (so menus don't drift the player)
       if (lockedRef.current) {
         controls.moveRight(-velocity.x * dt)
         controls.moveForward(-velocity.z * dt)
       }
 
-      // Vertical (jump / gravity)
       controls.object.position.y += velocity.y * dt
 
-      // Ground collision: sample terrain elevation at player's (x, z)
       const eyeHeight = 1.7
       const px = controls.object.position.x
       const pz = controls.object.position.z
-      const groundY = sampleTerrainHeight(px, pz, terrainParams.seed)
+      const groundY = digSystem.sampleHeight(px, pz)
       const floorY = groundY + eyeHeight
       if (controls.object.position.y < floorY) {
         velocity.y = 0
@@ -420,10 +464,7 @@ export default function FirstPersonGame() {
         canJump = true
       }
 
-      // Stream chunks: when the player crosses into a new grid cell, recycle
-      // far chunks to new positions at the far edge of the grid. Because the
-      // grid radius (3 chunks * 80 units = 240 units) extends beyond the fog
-      // end (220), newly-baked chunks are always hidden in fog — no pop-in.
+      // Chunk streaming
       const playerGridX = Math.round(px / CHUNK_SIZE)
       const playerGridZ = Math.round(pz / CHUNK_SIZE)
       if (playerGridX !== lastPlayerGridX || playerGridZ !== lastPlayerGridZ) {
@@ -432,64 +473,105 @@ export default function FirstPersonGame() {
         lastPlayerGridZ = playerGridZ
       }
 
-      // Held item visibility + bob/sway animation.
-      // Show the pickaxe only when slot 0 (pickaxe) is selected.
+      // Held item
       const isHolding = selectedSlotRef.current === 0
       if (heldItemRef.pickaxe.visible !== isHolding) {
         heldItemRef.pickaxe.visible = isHolding
       }
+
       if (isHolding) {
-        // Walking bob: detect horizontal movement speed
         const horizSpeed = Math.hypot(velocity.x, velocity.z)
         const walking = horizSpeed > 0.5 && canJump
-        if (walking) {
-          bobPhase += dt * (move.sprint ? 14 : 9)
-        } else {
-          bobPhase += dt * 2
-        }
-        const bobY = walking ? Math.sin(bobPhase * 2) * 0.025 : 0
-        const bobX = walking ? Math.cos(bobPhase) * 0.02 : 0
-        const swayZ = walking ? Math.sin(bobPhase) * 0.04 : 0
+        bobPhase += dt * (walking ? (move.sprint ? 12 : 8) : 1.2)
 
-        // Swing animation: advance the swing timer and compute a rotation
-        // curve that goes from 0 -> forward strike -> back to 0.
-        // No wind-up: the pickaxe chops straight down from the front.
-        let swingRot = 0
+        const walkAmp = walking ? 1 : 0
+        const bobY = Math.sin(bobPhase * 2) * 0.022 * walkAmp
+        const bobX = Math.cos(bobPhase) * 0.018 * walkAmp
+        const idleBobY = Math.sin(bobPhase * 0.9) * 0.006
+
+        let swingRotX = 0
+        let swingRotZ = 0
+        let swingOffsetY = 0
+
         if (swingTime >= 0) {
           swingTime += dt
           if (swingTime >= SWING_DURATION) {
-            swingTime = -1 // animation finished, return to idle
+            swingTime = -1
           } else {
-            const t = swingTime / SWING_DURATION // 0..1
-            // Sine envelope so motion starts and ends at 0 smoothly.
-            const envelope = Math.sin(t * Math.PI) // 0..1..0
-            // Strike forward only (positive), peak ~1.4 rad (~80deg).
-            swingRot = envelope * 1.4
+            const t = swingTime
+            if (t < WINDUP_END) {
+              const p = t / WINDUP_END
+              const e = 1 - Math.pow(1 - p, 3)
+              swingRotX = e * 0.55
+              swingRotZ = e * 0.08
+              swingOffsetY = e * 0.04
+            } else if (t < STRIKE_END) {
+              const p = (t - WINDUP_END) / (STRIKE_END - WINDUP_END)
+              const e = p * p
+              swingRotX = 0.55 - e * 2.15
+              swingRotZ = 0.08 - e * 0.18
+              swingOffsetY = 0.04 - e * 0.12
+            } else {
+              const p = (t - STRIKE_END) / (SWING_DURATION - STRIKE_END)
+              const e = 1 - Math.pow(1 - p, 3)
+              swingRotX = -1.6 + e * 1.6
+              swingRotZ = -0.10 + e * 0.10
+              swingOffsetY = -0.08 + e * 0.08
+            }
+
+            if (!impactDone && t >= STRIKE_END) {
+              impactDone = true
+              digSystem.tryImpact()
+            }
           }
         }
 
-        // Position the pickaxe in front of the camera using camera basis vectors
         const camQuat = camera.quaternion
         const offset = new THREE.Vector3(
           heldOffset.x + bobX,
-          heldOffset.y + bobY,
+          heldOffset.y + bobY + idleBobY + swingOffsetY,
           heldOffset.z
         )
         offset.applyQuaternion(camQuat)
         heldItemRef.pickaxe.position.copy(camera.position).add(offset)
         heldItemRef.pickaxe.quaternion.copy(camQuat)
-        // Swing rotation pivots around the handle (hand). Positive rotation
-        // around X makes the head swing forward/down in front of the player.
-        heldItemRef.swingPivot.rotation.x = swingRot
+        heldItemRef.swingPivot.rotation.x = swingRotX
+        heldItemRef.swingPivot.rotation.z = swingRotZ
       }
 
-      // Jump
+      digSystem.update(dt)
+
       if (move.jump && canJump && lockedRef.current) {
         velocity.y = 9
         canJump = false
       }
 
-      renderer.render(scene, camera)
+      // Camera shake on render
+      const shake = digSystem.getShake()
+      const shakeActive =
+        shake.x !== 0 || shake.y !== 0 || shake.z !== 0 || shake.rotZ !== 0
+
+      if (shakeActive) {
+        const savedPos = camera.position.clone()
+        const savedQuat = camera.quaternion.clone()
+
+        camera.position.x += shake.x
+        camera.position.y += shake.y
+        camera.position.z += shake.z
+
+        const rollQuat = new THREE.Quaternion().setFromAxisAngle(
+          new THREE.Vector3(0, 0, 1),
+          shake.rotZ
+        )
+        camera.quaternion.multiply(rollQuat)
+
+        renderer.render(scene, camera)
+
+        camera.position.copy(savedPos)
+        camera.quaternion.copy(savedQuat)
+      } else {
+        renderer.render(scene, camera)
+      }
 
       if (firstFrame) {
         firstFrame = false
@@ -518,7 +600,10 @@ export default function FirstPersonGame() {
         chunk.mesh.geometry.dispose()
       }
       chunkMat.dispose()
+      craterMat.dispose()
       dirtTexture.dispose()
+      digSystem.dispose()
+      vehicleSystem.dispose()
       renderer.dispose()
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement)
@@ -526,24 +611,20 @@ export default function FirstPersonGame() {
     }
   }, [])
 
-  // Click overlay to lock pointer
   const handleStart = () => {
     controlsRef.current?.lock()
   }
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-black">
-      {/* 3D mount */}
       <div ref={mountRef} className="absolute inset-0" />
 
-      {/* Crosshair */}
       {locked && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="w-1.5 h-1.5 rounded-full bg-white/80 shadow-[0_0_4px_rgba(0,0,0,0.8)]" />
         </div>
       )}
 
-      {/* HUD top-left */}
       {locked && (
         <div className="absolute top-4 left-4 pointer-events-none select-none">
           <div className="rounded-md bg-black/40 backdrop-blur px-3 py-2 text-xs text-white/90 font-mono">
@@ -552,21 +633,18 @@ export default function FirstPersonGame() {
         </div>
       )}
 
-      {/* Hotbar — 4 slots, bottom center */}
       {locked && (
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 pointer-events-none select-none">
           <Hotbar items={HOTBAR_ITEMS} selected={selectedSlot} />
         </div>
       )}
 
-      {/* Loading */}
       {!loaded && (
         <div className="absolute inset-0 flex items-center justify-center bg-zinc-900 text-white">
           <div className="text-lg">در حال بارگذاری محیط…</div>
         </div>
       )}
 
-      {/* Start / unlock overlay */}
       {loaded && !locked && (
         <div
           onClick={handleStart}
@@ -606,12 +684,6 @@ function KeyHint({ k, label }: { k: string; label: string }) {
   )
 }
 
-/**
- * Hotbar
- * A clean 4-slot hotbar at the bottom of the screen. Each slot can hold an
- * item icon (or be empty). The selected slot is highlighted; when nothing is
- * selected (selected === -1), no slot is highlighted.
- */
 function Hotbar({
   items,
   selected,
@@ -635,7 +707,6 @@ function Hotbar({
                 : 'bg-white/5 ring-1 ring-white/10',
             ].join(' ')}
           >
-            {/* Slot number badge */}
             <span
               className={[
                 'absolute top-1 left-1.5 text-[10px] font-mono font-semibold leading-none',
@@ -644,7 +715,6 @@ function Hotbar({
             >
               {i + 1}
             </span>
-            {/* Item icon or empty well */}
             {item.icon ? (
               <img
                 src={item.icon}
@@ -663,15 +733,7 @@ function Hotbar({
 }
 
 /**
- * makeDirtTexture
- * Procedurally generates a seamless dark-brown dirt texture on a canvas.
- * Layers:
- *  1. Base dark-brown fill
- *  2. Value noise (multi-octave) for clumps / variations
- *  3. Speckles (small pebbles / grains)
- *  4. Lighter cracks/veins for organic feel
- * Output is a CanvasTexture, tileable because noise is value-noise sampled
- * with wrapping coordinates.
+ * makeDirtTexture — procedural seamless dirt texture.
  */
 function makeDirtTexture(): THREE.CanvasTexture {
   const size = 512
@@ -680,17 +742,14 @@ function makeDirtTexture(): THREE.CanvasTexture {
   canvas.height = size
   const ctx = canvas.getContext('2d')!
 
-  // Base dark brown
   ctx.fillStyle = '#3a2716'
   ctx.fillRect(0, 0, size, size)
 
-  // Helper: tileable pseudo-random value noise
   const rand = (x: number, y: number) => {
     const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453
     return n - Math.floor(n)
   }
   const smooth = (t: number) => t * t * (3 - 2 * t)
-  // Value noise with bilinear interpolation, tileable with period = size
   const valueNoise = (x: number, y: number) => {
     const xi = Math.floor(x) % size
     const yi = Math.floor(y) % size
@@ -708,7 +767,6 @@ function makeDirtTexture(): THREE.CanvasTexture {
     const v = smooth(yf)
     return (v00 * (1 - u) + v10 * u) * (1 - v) + (v01 * (1 - u) + v11 * u) * v
   }
-  // Fractal (multi-octave) value noise
   const fbm = (x: number, y: number, octaves: number) => {
     let sum = 0
     let amp = 0.5
@@ -721,32 +779,27 @@ function makeDirtTexture(): THREE.CanvasTexture {
     return sum
   }
 
-  // Paint pixel-by-pixel using ImageData for performance and control
   const img = ctx.createImageData(size, size)
   const data = img.data
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const n = fbm(x * 0.06, y * 0.06, 5) // large clumps
-      const n2 = fbm(x * 0.25, y * 0.25, 3) // medium grain
-      const n3 = rand(x, y) // fine noise
+      const n = fbm(x * 0.06, y * 0.06, 5)
+      const n2 = fbm(x * 0.25, y * 0.25, 3)
+      const n3 = rand(x, y)
 
-      // Base dirt color: dark brown (#3a2716) -> mid brown (#5a3a1f) -> lighter (#7a542c)
       let r = 58 + n * 70 + n2 * 20
       let g = 39 + n * 50 + n2 * 14
       let b = 22 + n * 30 + n2 * 8
 
-      // Add dark spots (wet/darker dirt patches)
       const dark = Math.pow(fbm(x * 0.04 + 10, y * 0.04 + 10, 4), 2.5)
       r -= dark * 30
       g -= dark * 22
       b -= dark * 14
 
-      // Fine grain speckle
       r += (n3 - 0.5) * 18
       g += (n3 - 0.5) * 14
       b += (n3 - 0.5) * 10
 
-      // Clamp
       data[(y * size + x) * 4 + 0] = Math.max(0, Math.min(255, r))
       data[(y * size + x) * 4 + 1] = Math.max(0, Math.min(255, g))
       data[(y * size + x) * 4 + 2] = Math.max(0, Math.min(255, b))
@@ -755,7 +808,6 @@ function makeDirtTexture(): THREE.CanvasTexture {
   }
   ctx.putImageData(img, 0, 0)
 
-  // Add a few lighter "crack" veins for organic feel
   ctx.strokeStyle = 'rgba(120, 88, 50, 0.35)'
   ctx.lineWidth = 1
   for (let i = 0; i < 18; i++) {
@@ -772,7 +824,6 @@ function makeDirtTexture(): THREE.CanvasTexture {
     ctx.stroke()
   }
 
-  // Small pebble specks (lighter & darker)
   for (let i = 0; i < 220; i++) {
     const px = Math.random() * size
     const py = Math.random() * size
@@ -793,16 +844,9 @@ function makeDirtTexture(): THREE.CanvasTexture {
 // ---------------------------------------------------------------------------
 // Terrain height system
 // ---------------------------------------------------------------------------
-// A deterministic, hash-based value-noise so that:
-//   - terrainifyGeometry() bakes heights into the mesh vertices
-//   - sampleTerrainHeight(x, z) returns the SAME height at runtime for the
-//     player's collision, so walking feels consistent with what you see.
-// Using multiple octaves + a ridge component makes the terrain feel random
-// and varied (hills + bumps + sharper ridges), not a smooth sine wave.
 
 function hash2(x: number, y: number, seed: number): number {
-  // Deterministic pseudo-random in [0,1) from integer coords + seed
-  let h = Math.sin(x * 127.1 + y * 311.7 + seed * 0.013) * 43758.5453
+  const h = Math.sin(x * 127.1 + y * 311.7 + seed * 0.013) * 43758.5453
   return h - Math.floor(h)
 }
 
@@ -838,7 +882,6 @@ function fbm(x: number, y: number, octaves: number, seed: number): number {
   return sum / norm
 }
 
-// Ridged noise: produces sharper ridge lines instead of smooth hills.
 function ridged(x: number, y: number, octaves: number, seed: number): number {
   let sum = 0
   let amp = 0.5
@@ -846,7 +889,6 @@ function ridged(x: number, y: number, octaves: number, seed: number): number {
   let norm = 0
   for (let i = 0; i < octaves; i++) {
     const n = valueNoise2D(x * freq, y * freq, seed + i * 31)
-    // ridge = 1 - |2n-1|, then squared to sharpen
     const r = 1 - Math.abs(2 * n - 1)
     sum += amp * r * r
     norm += amp
@@ -861,12 +903,10 @@ interface TerrainParams {
   amplitude: number
   frequency: number
   octaves: number
-  ridgeWeight: number // 0..1, how much ridged noise to mix in
+  ridgeWeight: number
   seed: number
 }
 
-// The single source of truth for terrain height at a world (x, z).
-// Uses the same params as the mesh baking so collision matches visuals.
 const SHARED_TERRAIN: TerrainParams = {
   baseHeight: 0,
   amplitude: 7,
@@ -885,35 +925,13 @@ function sampleTerrainHeightWithParams(x: number, z: number, p: TerrainParams): 
   const fz = z * p.frequency
   const smoothN = fbm(fx, fz, p.octaves, p.seed)
   const ridgeN = ridged(fx, fz, p.octaves, p.seed + 999)
-  // Blend smooth + ridged for organic-but-varied terrain
   const combined = smoothN * (1 - p.ridgeWeight) + ridgeN * p.ridgeWeight
-  // combined is roughly in [0,1]; center around 0 and scale by amplitude
   return p.baseHeight + (combined - 0.5) * 2 * p.amplitude
 }
 
-// Mutates geometry vertices to apply terrain height. Geometry must already be
-// rotated so it lies on the XZ plane (Y is up).
-function terrainifyGeometry(geo: THREE.BufferGeometry, p: TerrainParams): void {
-  const pos = geo.attributes.position as THREE.BufferAttribute
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i)
-    const z = pos.getZ(i)
-    const y = sampleTerrainHeightWithParams(x, z, p)
-    pos.setY(i, y)
-  }
-  pos.needsUpdate = true
-}
-
-/**
- * orientHandleUp
- * Rotates a model so its longest axis (the handle) points along +Y with the
- * head (the wider end) on top, and the head's bar runs along +X.
- * Works from the actual vertices, so it doesn't depend on how the GLB was authored.
- */
 function orientHandleUp(model: THREE.Object3D): void {
   model.updateMatrixWorld(true)
 
-  // Collect all vertices in model space
   const pts: THREE.Vector3[] = []
   model.traverse((child) => {
     const m = child as THREE.Mesh
@@ -929,15 +947,13 @@ function orientHandleUp(model: THREE.Object3D): void {
   const size = box.getSize(new THREE.Vector3())
   const dims = [size.x, size.y, size.z]
   const order = [0, 1, 2].sort((a, b) => dims[b] - dims[a])
-  const handleIdx = order[0] // longest axis = handle
-  const barIdx = order[1] // second longest = head bar
+  const handleIdx = order[0]
+  const barIdx = order[1]
 
   const comp = (v: THREE.Vector3, i: number) => (i === 0 ? v.x : i === 1 ? v.y : v.z)
   const hMin = comp(box.min, handleIdx)
   const hLen = dims[handleIdx]
 
-  // Measure how wide the model is at each end of the handle axis.
-  // The head end has the larger cross-section along the bar axis.
   let loMin = Infinity, loMax = -Infinity, hiMin = Infinity, hiMax = -Infinity
   for (const v of pts) {
     const t = (comp(v, handleIdx) - hMin) / hLen
@@ -953,9 +969,55 @@ function orientHandleUp(model: THREE.Object3D): void {
   if (handleIdx === 0) h.x = sign; else if (handleIdx === 1) h.y = sign; else h.z = sign
   if (barIdx === 0) b.x = 1; else if (barIdx === 1) b.y = 1; else b.z = 1
 
-  // Rotation that sends: bar -> +X, handle (toward head) -> +Y
   const z = new THREE.Vector3().crossVectors(b, h)
-  const basis = new THREE.Matrix4().makeBasis(b, h, z) // columns: target -> local
-  model.quaternion.setFromRotationMatrix(basis.transpose()) // local -> target
+  const basis = new THREE.Matrix4().makeBasis(b, h, z)
+  model.quaternion.setFromRotationMatrix(basis.transpose())
   model.updateMatrixWorld(true)
+}
+
+class SimpleTimer {
+  private _previousTime = 0
+  private _currentTime = 0
+  private _delta = 0
+  private _elapsed = 0
+  private _startTime = 0
+  private _timescale = 1
+
+  constructor() {
+    this._startTime = performance.now()
+    this._previousTime = this._startTime
+    this._currentTime = this._startTime
+  }
+
+  update(timestamp?: number) {
+    this._currentTime = timestamp ?? performance.now()
+    this._delta = (this._currentTime - this._previousTime) / 1000
+    this._elapsed = (this._currentTime - this._startTime) / 1000
+    this._previousTime = this._currentTime
+    return this
+  }
+
+  getDelta() {
+    return this._delta * this._timescale
+  }
+
+  getElapsed() {
+    return this._elapsed * this._timescale
+  }
+
+  setTimescale(scale: number) {
+    this._timescale = scale
+    return this
+  }
+
+  reset() {
+    this._startTime = performance.now()
+    this._previousTime = this._startTime
+    this._currentTime = this._startTime
+    this._delta = 0
+    this._elapsed = 0
+    return this
+  }
+
+  dispose() {}
 }
